@@ -1,17 +1,15 @@
 
-import math
-from inspect import isfunction
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
-from einops import rearrange
 
-import torch
-from torch import nn, einsum
 import torch.nn.functional as F
+from torch.optim import Adam
+from torch.utils.data import DataLoader
 
 from torchvision import transforms
-from torch.utils.data import DataLoader
+from torchvision.utils import save_image
 from torchvision.transforms import Compose, ToTensor, Lambda, ToPILImage, CenterCrop, Resize
 from datasets import load_dataset
 
@@ -59,12 +57,6 @@ def transforms(examples):
 
    return examples
 
-transformed_dataset = dataset.with_transform(transforms).remove_columns("label")
-
-# create dataloader
-dataloader = DataLoader(transformed_dataset["train"], batch_size=batch_size, shuffle=True)
-
-batch = next(iter(dataloader))
 
 @torch.no_grad()
 def p_sample(model, x, t, t_index):
@@ -105,7 +97,100 @@ def p_sample_loop(model, shape):
         imgs.append(img.cpu().numpy())
     return imgs
 
+# forward diffusion (using the nice property)
+def q_sample(x_start, t, noise=None):
+    if noise is None:
+        noise = torch.randn_like(x_start)
+
+    sqrt_alphas_cumprod_t = extract(sqrt_alphas_cumprod, t, x_start.shape)
+    sqrt_one_minus_alphas_cumprod_t = extract(
+        sqrt_one_minus_alphas_cumprod, t, x_start.shape
+    )
+
+    return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
+
+
+def p_losses(denoise_model, x_start, t, noise=None, loss_type="l1"):
+    if noise is None:
+        noise = torch.randn_like(x_start)
+
+    x_noisy = q_sample(x_start=x_start, t=t, noise=noise)
+    predicted_noise = denoise_model(x_noisy, t)
+
+    if loss_type == 'l1':
+        loss = F.l1_loss(noise, predicted_noise)
+    elif loss_type == 'l2':
+        loss = F.mse_loss(noise, predicted_noise)
+    elif loss_type == "huber":
+        loss = F.smooth_l1_loss(noise, predicted_noise)
+    else:
+        raise NotImplementedError()
+
+    return loss
+
 
 @torch.no_grad()
 def sample(model, image_size, batch_size=16, channels=3):
     return p_sample_loop(model, shape=(batch_size, channels, image_size, image_size))
+
+
+def num_to_groups(num, divisor):
+    groups = num // divisor
+    remainder = num % divisor
+    arr = [divisor] * groups
+    if remainder > 0:
+        arr.append(remainder)
+    return arr
+
+
+if __name__ == "__main__":
+    transformed_dataset = dataset.with_transform(transforms).remove_columns("label")
+
+    # create dataloader
+    dataloader = DataLoader(transformed_dataset["train"], batch_size=batch_size, shuffle=True)
+
+    batch = next(iter(dataloader))
+
+    results_folder = Path("./results")
+    results_folder.mkdir(exist_ok=True)
+    save_and_sample_every = 1000
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = Unet(
+        dim=image_size,
+        channels=channels,
+        dim_mults=(1, 2, 4,)
+    )
+    model.to(device)
+
+    optimizer = Adam(model.parameters(), lr=1e-3)
+
+epochs = 5
+
+for epoch in range(epochs):
+    for step, batch in enumerate(dataloader):
+      optimizer.zero_grad()
+
+      batch_size = batch["pixel_values"].shape[0]
+      batch = batch["pixel_values"].to(device)
+
+      # Algorithm 1 line 3: sample t uniformally for every example in the batch
+      t = torch.randint(0, timesteps, (batch_size,), device=device).long()
+
+      loss = p_losses(model, batch, t, loss_type="huber")
+
+      if step % 10 == 0:
+        print("Loss:", loss.item())
+
+      loss.backward()
+      optimizer.step()
+
+      # save generated images
+      if step != 0 and step % save_and_sample_every == 0:
+        milestone = step // save_and_sample_every
+        batches = num_to_groups(4, batch_size)
+        all_images_list = list(map(lambda n: sample(model, batch_size=n, channels=channels), batches))
+        all_images = torch.cat(all_images_list, dim=0)
+        all_images = (all_images + 1) * 0.5
+        save_image(all_images, str(results_folder / f'sample-{milestone}.png'), nrow = 6)
